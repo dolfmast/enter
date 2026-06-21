@@ -726,6 +726,7 @@ input[type=text]:focus,select:focus,input[type=search]:focus,input[type=date]:fo
     <p style="font-size:13px;color:var(--text2);margin-bottom:14px">교육참석 기록 또는 설계사 전체 데이터를 삭제합니다. 되돌릴 수 없습니다.</p>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn btn-outline" style="border-color:var(--amber);color:var(--amber)" onclick="clearAttendance()">교육참석기록만 삭제</button>
+      <button class="btn btn-outline" style="border-color:#e53935;color:#e53935" onclick="clearAgents()">설계사 일괄 삭제</button>
       <button class="btn btn-red" onclick="clearAll()">전체 초기화</button>
     </div>
   </div>
@@ -804,6 +805,215 @@ input[type=text]:focus,select:focus,input[type=search]:focus,input[type=date]:fo
 // ============================================================
 //  STORAGE KEYS
 // ============================================================
+// ============================================================
+//  구글 시트 백엔드 동기화
+// ============================================================
+const SHEET_URL = 'https://script.google.com/macros/s/AKfycbyxD97zJo9FBr02dFpYAm_NOWd2z6eq6fstn_6H7--qREY3Qk0Kod8HL6c24LEUedj7/exec';
+const SYNC_INTERVAL = 30000; // 30초마다 동기화
+let _syncing = false;
+let _pushing = false; // push 중에는 sync 차단
+let _lastSync = 0;
+
+/* 시트에서 전체 데이터 가져와서 로컬스토리지에 저장 */
+async function syncFromSheet(){
+  if(_syncing || _pushing) return; // 푸시 중이면 동기화 스킵 (덮어쓰기 방지)
+  _syncing = true;
+  try {
+    showSyncStatus('☁️ 동기화 중...');
+    const res = await fetch(SHEET_URL + '?action=getAll&t=' + Date.now());
+    const json = await res.json();
+    if(!json.ok) throw new Error(json.error || 'sync failed');
+
+    // 시트 데이터를 로컬에 덮어쓰기 (pin/phone은 문자열로 정규화)
+    const agents  = (json.data.agents  || []).map(a => ({
+      ...a,
+      id: String(a.id),
+      pin: String(a.pin || '').padStart(4,'0'),
+      phone: String(a.phone || ''),
+    }));
+    const records = (json.data.records || []).map(r => ({
+      ...r,
+      id: String(r.id),
+      agentId: String(r.agentId),
+      pin: String(r.pin || ''),
+    }));
+    const leaves  = (json.data.leaves  || []).map(l => ({
+      ...l,
+      id: String(l.id),
+      agentId: String(l.agentId),
+    }));
+
+    localStorage.setItem('kga_agents_v2', JSON.stringify(agents));
+    localStorage.setItem('kga_att_v2',    JSON.stringify(records));
+    localStorage.setItem('kga_leaves_v1', JSON.stringify(leaves));
+
+    // 동기화 후 화면 갱신 (체크인 화면이 열려있으면)
+    if(typeof renderDashboard === 'function' && document.getElementById('dashboard')?.classList.contains('active')) {
+      renderDashboard();
+    }
+
+    // 설정 데이터(지점/팀매핑/보안/시간)도 함께 받아오기
+    await pullSettingsFromSheet();
+
+    _lastSync = Date.now();
+    showSyncStatus('✅ 동기화 완료', 2000);
+    return true;
+  } catch(e){
+    console.error('sync error', e);
+    showSyncStatus('⚠️ 시트 연결 실패 (오프라인 모드)', 3000);
+    return false;
+  } finally {
+    _syncing = false;
+  }
+}
+
+/* 시트에 출석 1건 추가 (체크인 시 호출) */
+async function pushRecordToSheet(record){
+  try {
+    const params = new URLSearchParams();
+    params.append('action', 'addRecord');
+    params.append('data', JSON.stringify(record));
+    const res = await fetch(SHEET_URL, { method:'POST', body: params });
+    const json = await res.json();
+    return json.ok;
+  } catch(e){
+    console.error('push record error', e);
+    return false;
+  }
+}
+
+/* 시트에 설계사 전체 명단 저장 (등록/수정/삭제 후 호출) */
+async function pushAgentsToSheet(){
+  _pushing = true;
+  try {
+    const agents = JSON.parse(localStorage.getItem('kga_agents_v2') || '[]');
+    const params = new URLSearchParams();
+    params.append('action', 'saveAgents');
+    params.append('data', JSON.stringify(agents));
+    const res = await fetch(SHEET_URL, { method:'POST', body: params });
+    const json = await res.json();
+    return json.ok;
+  } catch(e){
+    console.error('push agents error', e);
+    return false;
+  } finally {
+    _pushing = false;
+  }
+}
+
+/* ── 설정 데이터(지점/팀매핑/보안/시간) 시트에 푸시 ── */
+async function pushSettingsToSheet(partial){
+  _pushing = true;
+  try {
+    // partial = {branches?, teamMap?, secCfg?, branchCfg?, baseCfg?, pinMode?, depts?}
+    const data = partial || {
+      branches:  JSON.parse(localStorage.getItem('kga_branches_v1') || '[]'),
+      teamMap:   JSON.parse(localStorage.getItem('kga_tmap_v1')     || '{}'),
+      secCfg:    JSON.parse(localStorage.getItem('kga_sec_v1')      || 'null'),
+      branchCfg: JSON.parse(localStorage.getItem('kga_branch_cfg_v1') || '{}'),
+      baseCfg:   JSON.parse(localStorage.getItem('kga_cfg_v2')      || 'null'),
+      pinMode:   JSON.parse(localStorage.getItem('kga_pin_mode_v1') || '"random"'),
+      depts:     JSON.parse(localStorage.getItem('kga_depts_v1')    || '[]'),
+    };
+    const body = 'action=saveSettings&data=' + encodeURIComponent(JSON.stringify(data));
+    const res = await fetch(SHEET_URL, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: body });
+    const json = await res.json();
+    return json.ok;
+  } catch(e){
+    console.error('push settings error', e);
+    return false;
+  } finally {
+    _pushing = false;
+  }
+}
+
+/* ── 시트에서 설정 데이터 가져와서 로컬에 저장 ── */
+async function pullSettingsFromSheet(){
+  try {
+    const res = await fetch(SHEET_URL + '?action=getSettings&t=' + Date.now());
+    const json = await res.json();
+    if(!json.ok) return false;
+    const d = json.data;
+    if(d.branches  && d.branches.length)  localStorage.setItem('kga_branches_v1', JSON.stringify(d.branches));
+    if(d.teamMap)   localStorage.setItem('kga_tmap_v1',       JSON.stringify(d.teamMap));
+    if(d.secCfg)    localStorage.setItem('kga_sec_v1',        JSON.stringify(d.secCfg));
+    if(d.branchCfg) localStorage.setItem('kga_branch_cfg_v1', JSON.stringify(d.branchCfg));
+    if(d.baseCfg)   localStorage.setItem('kga_cfg_v2',        JSON.stringify(d.baseCfg));
+    if(d.pinMode)   localStorage.setItem('kga_pin_mode_v1',   JSON.stringify(d.pinMode));
+    if(d.depts && d.depts.length) localStorage.setItem('kga_depts_v1', JSON.stringify(d.depts));
+    return true;
+  } catch(e){
+    console.error('pull settings error', e);
+    return false;
+  }
+}
+
+/* 시트에 휴가 전체 저장 */
+async function pushLeavesToSheet(){
+  _pushing = true;
+  try {
+    const leaves = JSON.parse(localStorage.getItem('kga_leaves_v1') || '[]');
+    const params = new URLSearchParams();
+    params.append('action', 'saveLeaves');
+    params.append('data', JSON.stringify(leaves));
+    const res = await fetch(SHEET_URL, { method:'POST', body: params });
+    const json = await res.json();
+    return json.ok;
+  } catch(e){
+    console.error('push leaves error', e);
+    return false;
+  } finally {
+    _pushing = false;
+  }
+}
+
+/* 시트에 출석 기록 전체 덮어쓰기 (일괄삭제 등에서 호출) */
+async function pushRecordsToSheet(){
+  _pushing = true;
+  try {
+    const records = JSON.parse(localStorage.getItem('kga_att_v2') || '[]');
+    const params = new URLSearchParams();
+    params.append('action', 'saveRecords');
+    params.append('data', JSON.stringify(records));
+    const res = await fetch(SHEET_URL, { method:'POST', body: params });
+    const json = await res.json();
+    return json.ok;
+  } catch(e){
+    console.error('push records error', e);
+    return false;
+  } finally {
+    _pushing = false;
+  }
+}
+
+/* 동기화 상태 표시 (우측 상단 작은 토스트) */
+function showSyncStatus(msg, autoHide){
+  let el = document.getElementById('sync-status');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'sync-status';
+    el.style.cssText = 'position:fixed;top:70px;right:16px;background:rgba(30,39,97,0.9);color:#fff;padding:6px 12px;border-radius:6px;font-size:11px;z-index:8000;box-shadow:0 2px 8px rgba(0,0,0,0.2);transition:opacity 0.3s;font-family:inherit';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.opacity = '1';
+  el.style.display = 'block';
+  if(autoHide){
+    clearTimeout(el._t);
+    el._t = setTimeout(()=>{ el.style.opacity = '0'; setTimeout(()=>{el.style.display='none';}, 300); }, autoHide);
+  }
+}
+
+/* 주기적 동기화 (관리자 모드에서만) */
+function startAutoSync(){
+  // 즉시 1회
+  syncFromSheet();
+  // 30초마다 자동 갱신
+  setInterval(()=>{
+    if(document.visibilityState === 'visible') syncFromSheet();
+  }, SYNC_INTERVAL);
+}
+
 const K_AGENTS   = 'kga_agents_v2';
 const K_ATT      = 'kga_att_v2';
 const K_CFG      = 'kga_cfg_v2';
@@ -817,12 +1027,12 @@ function load(k, def){ try{ return JSON.parse(localStorage.getItem(k)||'null') ?
 function save(k, v){ localStorage.setItem(k, JSON.stringify(v)); }
 
 function getAgents(){ return load(K_AGENTS, []); }
-function saveAgents(a){ save(K_AGENTS, a); }
+function saveAgents(a){ save(K_AGENTS, a); pushAgentsToSheet(); }
 function getRecords(){ return load(K_ATT, []); }
 function saveRecords(r){ save(K_ATT, r); }
 function getCfg(){ return load(K_CFG, {hour:9, min:0, lateMin:30}); }
 function getDepts(){ return load(K_DEPTS, ['신설동지점','호평지점','노원지점','강북지점','파주지점']); }
-function saveDepts(d){ save(K_DEPTS, d); }
+function saveDepts(d){ save(K_DEPTS, d); pushSettingsToSheet({depts: d}); }
 
 function resetDeptsToDefault(){
   const DEFAULT = ['신설동지점','호평지점','노원지점','강북지점','파주지점'];
@@ -859,7 +1069,7 @@ function getStatus(timeStr, deptName){
 const K_LEAVES = 'kga_leaves_v1';
 
 function getLeaves(){ return load(K_LEAVES, []); }
-function saveLeaves(arr){ save(K_LEAVES, arr); }
+function saveLeaves(arr){ save(K_LEAVES, arr); pushLeavesToSheet(); }
 
 /* 휴가 종류별 라벨 (이모지 포함) */
 const LEAVE_ICONS = {
@@ -957,7 +1167,7 @@ function addLeave(){
 }
 
 /* 휴가 삭제 — 연결된 출석 기록도 함께 삭제 */
-function deleteLeave(leaveId){
+async function deleteLeave(leaveId){
   const leaves = getLeaves();
   const leave = leaves.find(l => l.id === leaveId);
   if(!leave) return;
@@ -965,11 +1175,20 @@ function deleteLeave(leaveId){
 
   saveLeaves(leaves.filter(l => l.id !== leaveId));
   // 연결된 출석 기록 삭제 (leaveId로 매칭)
+  const hadLinked = getRecords().some(r => r.leaveId === leaveId);
   saveRecords(getRecords().filter(r => r.leaveId !== leaveId));
 
   renderLeaves();
   renderDashboard();
   showToast('휴가가 삭제됐습니다');
+
+  // 연결된 출석 기록이 있었으면 시트에도 반영
+  if(hadLinked){
+    showSyncStatus('☁️ 시트에 반영 중...');
+    const ok = await pushRecordsToSheet();
+    if(ok){ showSyncStatus('✅ 시트 반영 완료', 2000); }
+    else { showSyncStatus('⚠️ 시트 반영 실패', 5000); }
+  }
 }
 
 /* 휴가 상태 계산 */
@@ -1151,7 +1370,7 @@ function renderBranchList(){
 }
 
 /* ── 좌표 직접 입력 (현장 GPS 없을 때) ── */
-function manualBranchLoc(id){
+async function manualBranchLoc(id){
   const branches = getBranches();
   const b = branches.find(x=>x.id===id);
   if(!b) return;
@@ -1164,11 +1383,19 @@ function manualBranchLoc(id){
   b.lat = parts[0]; b.lon = parts[1];
   save(K_BRANCHES, branches);
   renderBranchList();
-  showToast('✅ '+b.name+' 좌표 저장 완료');
+  showSyncStatus('☁️ 시트에 좌표 저장 중...');
+  const ok = await pushSettingsToSheet({branches});
+  if(ok){
+    showSyncStatus('✅ 모든 기기에 반영됨', 3000);
+    showToast('✅ '+b.name+' 좌표 저장 완료');
+  } else {
+    showSyncStatus('⚠️ 시트 반영 실패', 4000);
+    showToast(b.name+' 로컬 저장만 됨');
+  }
 }
 
 /* ── 지점 추가 ── */
-function addBranch(){
+async function addBranch(){
   const name = prompt('지점 이름을 입력하세요\n예) 신설동지점, 호평지점');
   if(!name || !name.trim()) return;
   const branches = getBranches();
@@ -1177,6 +1404,7 @@ function addBranch(){
   save(K_BRANCHES, branches);
   renderBranchList();
   renderTeamMap();
+  await pushSettingsToSheet({branches});
 }
 
 /* ── 지점 삭제 ── */
@@ -1203,7 +1431,16 @@ async function registerBranchLoc(id){
     b.lat = pos.lat; b.lon = pos.lon;
     save(K_BRANCHES, branches);
     renderBranchList();
-    showToast(`✅ "${b.name}" 위치 등록 완료 (정확도 ±${Math.round(pos.acc)}m)`);
+    // 시트에 즉시 푸시
+    showSyncStatus('☁️ 시트에 위치 저장 중...');
+    const ok = await pushSettingsToSheet({branches});
+    if(ok){
+      showSyncStatus('✅ 모든 기기에 반영됨', 3000);
+      showToast(`✅ "${b.name}" 위치 등록 완료 (정확도 ±${Math.round(pos.acc)}m)`);
+    } else {
+      showSyncStatus('⚠️ 시트 반영 실패', 4000);
+      showToast(`"${b.name}" 로컬 저장만 됨 — 시트 반영 실패`);
+    }
   } catch(e){
     showToast('위치 권한을 허용해주세요.');
   }
@@ -1233,7 +1470,7 @@ function renderTeamMap(){
 }
 
 /* ── 팀 → 지점 매핑 저장 ── */
-function saveTeamMap(dept, branchId){
+async function saveTeamMap(dept, branchId){
   const tmap = getTeamMap();
   if(branchId) tmap[dept] = branchId;
   else delete tmap[dept];
@@ -1242,13 +1479,14 @@ function saveTeamMap(dept, branchId){
 }
 
 /* ── 보안 설정 저장 ── */
-function saveSecCfg(){
+async function saveSecCfg(){
   const gps    = document.getElementById('cfg-gps')?.checked || false;
   const dev    = document.getElementById('cfg-dev')?.checked || false;
   const radius = parseInt(document.getElementById('cfg-radius')?.value || '100');
   save(K_SEC, {gps, dev, radius});
   const sub = document.getElementById('gps-sub');
   if(sub) sub.style.display = gps ? 'block' : 'none';
+  await pushSettingsToSheet({secCfg: {gps, dev, radius}});
   showToast('보안 설정이 저장됐습니다');
 }
 
@@ -1361,7 +1599,7 @@ function getCompanyLoc(){ return null; } // 더 이상 단일 위치 사용 안 
 const K_PIN_MODE = 'kga_pin_mode_v1'; // 'phone' | 'random'
 
 function getPinMode(){ return load(K_PIN_MODE, 'random'); }
-function savePinMode(m){ save(K_PIN_MODE, m); }
+async function savePinMode(m){ save(K_PIN_MODE, m); await pushSettingsToSheet({pinMode: m}); }
 
 /* 핸드폰번호에서 뒷 4자리 추출 */
 function phoneLastFour(phone){
@@ -1525,7 +1763,7 @@ function updateDots(){
 async function checkPin(){
   const cfg     = getSecCfg();
   const agents  = getAgents();
-  const agent   = agents.find(a=>a.pin===pinBuffer);
+  const agent   = agents.find(a=>String(a.pin).padStart(4,'0')===pinBuffer);
 
   /* ① PIN 불일치 */
   if(!agent){
@@ -1564,11 +1802,18 @@ async function checkPin(){
 
   /* ④ GPS 위치 검증 — 소속팀 → 지점 좌표로 비교 */
   if(cfg.gps){
-    // 소속 지점 찾기
+    // 소속 지점 찾기 (수동 매핑 → 자동 이름매칭 순서)
     const tmap     = getTeamMap();
     const branches = getBranches();
+    let branch = null;
     const branchId = tmap[agent.dept];
-    const branch   = branchId ? branches.find(b=>b.id===branchId) : null;
+    if(branchId){
+      branch = branches.find(b=>b.id===branchId);
+    }
+    // 매핑이 없으면 팀명과 지점명이 같은 곳 자동 매칭
+    if(!branch){
+      branch = branches.find(b=>b.name===agent.dept);
+    }
 
     if(!branch){
       pinErr(`⚠️ "${agent.dept}" 팀의 지점이 설정되지 않았습니다. 관리자에게 문의하세요.`);
@@ -1605,6 +1850,7 @@ async function checkPin(){
     lon: _currentPos ? _currentPos.lon.toFixed(5) : '',
   };
   const recs = getRecords(); recs.unshift(rec); saveRecords(recs);
+  pushRecordToSheet(rec); // 시트에 즉시 푸시
 
   document.getElementById('pin-form').style.display='none';
   document.getElementById('success-wrap').style.display='block';
@@ -1646,7 +1892,7 @@ function resetPin(){
 // ============================================================
 //  AGENT MANAGEMENT
 // ============================================================
-function addAgent(){
+async function addAgent(){
   const name=document.getElementById('ag-name').value.trim();
   const dept=document.getElementById('ag-dept').value;
   const phone=document.getElementById('ag-phone').value.trim();
@@ -1657,25 +1903,49 @@ function addAgent(){
     showToast('같은 이름+팀의 설계사가 이미 등록됐습니다');return;
   }
   const mode=getPinMode();
-  const usedPins=new Set(agents.map(a=>a.pin));
+  const usedPins=new Set(agents.map(a=>String(a.pin)));
   const {pin}=calcNewPin({phone, name, dept}, usedPins, mode);
   agents.push({id:String(Date.now()), name, dept, phone, pin, pinMonth:currentMonth(), createdAt:today()});
-  saveAgents(agents);
+
+  save(K_AGENTS, agents);
   document.getElementById('ag-name').value='';
   document.getElementById('ag-phone').value='';
   document.getElementById('ag-dept').value='';
   toggleAddForm(null);
   renderAgents();
-  showToast(`${name} 님 등록 완료 · PIN: ${pin}`);
+
+  showSyncStatus('☁️ 시트에 등록 중...');
+  const ok = await pushAgentsToSheet();
+  if(ok){
+    showSyncStatus('✅ 등록 완료', 2000);
+    showToast(`${name} 님 등록 완료 · PIN: ${pin}`);
+  } else {
+    showSyncStatus('⚠️ 시트 반영 실패 — 다시 시도하세요', 5000);
+  }
 }
 
-function deleteAgent(id){
+async function deleteAgent(id){
   const agents=getAgents();
-  const agent=agents.find(a=>a.id===id);
+  const agent=agents.find(a=>String(a.id)===String(id));
   if(!agent || !confirm(`${agent.name} 님을 삭제할까요?\n교육참석 기록은 유지됩니다.`)) return;
-  saveAgents(agents.filter(a=>a.id!==id));
+
+  // 1) 로컬에서 먼저 제거
+  const filtered = agents.filter(a=>String(a.id)!==String(id));
+  save(K_AGENTS, filtered); // saveAgents 대신 save 직접 호출 (이중 푸시 방지)
   renderAgents();
   showToast(`${agent.name} 님이 삭제됐습니다`);
+
+  // 2) 시트에 동기적으로 푸시 (완료 대기)
+  showSyncStatus('☁️ 시트에 삭제 반영 중...');
+  const ok = await pushAgentsToSheet();
+  if(ok){
+    showSyncStatus('✅ 삭제 완료', 2000);
+  } else {
+    showSyncStatus('⚠️ 시트 반영 실패 — 다시 시도하세요', 5000);
+    // 실패 시 로컬 복원
+    save(K_AGENTS, agents);
+    renderAgents();
+  }
 }
 
 function renewPin(id){
@@ -1839,24 +2109,42 @@ function handleExcelFile(file){
       const ws = wb.Sheets[wb.SheetNames[0]];
       const raw = XLSX.utils.sheet_to_json(ws, { header:1, defval:'' });
 
-      // 헤더 행 자동 감지: 첫 행에 숫자가 아닌 텍스트가 있으면 헤더로 간주
       let rows = raw.filter(r => r.some(c => String(c).trim() !== ''));
-      const firstRow = rows[0] || [];
-      const looksLikeHeader = firstRow.some(c => {
-        const s = String(c).trim();
-        return s && isNaN(s) && !s.match(/^01[0-9]/); // 숫자·전화번호 아니면 헤더
-      });
-      // 이름열이 '이름' '성명' 등이면 헤더
-      const nameKeywords = ['이름','성명','name','팀장','설계사'];
-      const isHeader = looksLikeHeader && nameKeywords.some(k => String(firstRow[0]).includes(k));
-      if(isHeader) rows = rows.slice(1);
+      if(!rows.length){ showToast('빈 파일입니다.'); return; }
 
-      // 유효 행 필터 (이름 필수)
+      // 헤더 자동 감지: 열 이름으로 이름/지점/전화번호 매핑
+      const firstRow = rows[0].map(c => String(c).trim());
+      const nameKW  = ['이름','성명','name','설계사','설계사명','팀장','팀장명','성함','agent'];
+      const deptKW  = ['지점','소속','부서','팀','dept','branch','소속팀','소속지점','지점명','부서명','팀명','지사','영업점','영업소','office'];
+      const phoneKW = ['전화','전화번호','연락처','핸드폰','휴대폰','phone','mobile','tel','번호','hp','연락'];
+
+      let colName = -1, colDept = -1, colPhone = -1;
+      firstRow.forEach((h, i) => {
+        const low = h.toLowerCase();
+        if(colName  === -1 && nameKW.some(k  => low.includes(k.toLowerCase())))  colName  = i;
+        if(colDept  === -1 && deptKW.some(k  => low.includes(k.toLowerCase())))  colDept  = i;
+        if(colPhone === -1 && phoneKW.some(k => low.includes(k.toLowerCase()))) colPhone = i;
+      });
+
+      const hasHeader = colName !== -1 || colDept !== -1 || colPhone !== -1;
+      if(hasHeader){
+        rows = rows.slice(1); // 헤더 행 제거
+        // 감지된 열이 없으면 나머지 열에서 순서대로 배정
+        const usedCols = [colName, colDept, colPhone].filter(c => c >= 0);
+        const unusedCols = firstRow.map((_,i) => i).filter(i => !usedCols.includes(i));
+        if(colName  === -1 && unusedCols.length > 0) colName  = unusedCols.shift();
+        if(colDept  === -1 && unusedCols.length > 0) colDept  = unusedCols.shift();
+        if(colPhone === -1 && unusedCols.length > 0) colPhone = unusedCols.shift();
+      } else {
+        // 헤더 없으면 기본: A=이름, B=지점, C=전화번호
+        colName = 0; colDept = 1; colPhone = 2;
+      }
+
       _excelRows = rows
         .map(r => ({
-          name:  String(r[0]||'').trim(),
-          dept:  String(r[1]||'').trim(),
-          phone: String(r[2]||'').trim(),
+          name:  String(r[colName]  || '').trim(),
+          dept:  colDept  >= 0 ? String(r[colDept]  || '').trim() : '',
+          phone: colPhone >= 0 ? String(r[colPhone] || '').trim() : '',
         }))
         .filter(r => r.name.length > 0);
 
@@ -1874,7 +2162,7 @@ function renderExcelPreview(fileName){
   const depts = getDepts();
   const defaultDept = depts[0] || '';
   const agents = getAgents();
-  const existNames = new Set(agents.map(a => a.name));
+  const existKeys = new Set(agents.map(a => a.name + '::' + a.dept));
 
   const tbody = document.getElementById('excel-preview-tbody');
   const title = document.getElementById('excel-preview-title');
@@ -1886,9 +2174,10 @@ function renderExcelPreview(fileName){
   const previewRows = _excelRows.slice(0, 10); // 미리보기는 최대 10행
 
   tbody.innerHTML = previewRows.map(r => {
-    const isDup = existNames.has(r.name);
-    const resolvedDept = r.dept || defaultDept;
-    const hasNoDept = !r.dept;
+    const matched = matchDept(r.dept, depts);
+    const resolvedDept = matched || defaultDept;
+    const isDup = existKeys.has(r.name + '::' + resolvedDept);
+    const hasNoDept = !matched;
     if(isDup) dupCount++;
     if(hasNoDept) noDeptCount++;
     return `<tr style="background:${isDup?'#fff8e1':''}">
@@ -1907,8 +2196,8 @@ function renderExcelPreview(fileName){
   }).join('');
 
   const total = _excelRows.length;
-  const newCount = total - _excelRows.filter(r => existNames.has(r.name)).length;
-  title.textContent = `파일: ${fileName} — 전체 ${total}행 (신규 ${newCount}명, 중복 ${_excelRows.filter(r=>existNames.has(r.name)).length}명)${total>10?' — 미리보기 10행':''}`;
+  const newCount = total - _excelRows.filter(r => existKeys.has(r.name + '::' + (matchDept(r.dept, depts) || defaultDept))).length;
+  title.textContent = `파일: ${fileName} — 전체 ${total}행 (신규 ${newCount}명, 중복 ${total - newCount}명)${total>10?' — 미리보기 10행':''}`;
   importBtn.textContent = `✅ ${newCount}명 등록 시작`;
   importBtn.disabled = newCount === 0;
   preview.style.display = 'block';
@@ -1958,15 +2247,16 @@ function parsePastePreview(){
   if(!_pasteRows.length){ preview.style.display = 'none'; return; }
 
   const agents = getAgents();
-  const existNames = new Set(agents.map(a => a.name));
-  const newCount = _pasteRows.filter(r => !existNames.has(r.name)).length;
+  const existKeys = new Set(agents.map(a => a.name + '::' + a.dept));
+  const newCount = _pasteRows.filter(r => !existKeys.has(r.name + '::' + (matchDept(r.dept, depts) || defaultDept))).length;
 
   tbody.innerHTML = _pasteRows.slice(0, 10).map(r => {
-    const isDup = existNames.has(r.name);
-    const dept = r.dept || defaultDept;
+    const matched = matchDept(r.dept, depts);
+    const dept = matched || defaultDept;
+    const isDup = existKeys.has(r.name + '::' + dept);
     return `<tr>
       <td style="padding:6px 10px;border-bottom:1px solid #f0f0f0">${r.name}</td>
-      <td style="padding:6px 10px;border-bottom:1px solid #f0f0f0">${dept}${!r.dept?' <span style="font-size:10px;color:var(--text2)">(기본)</span>':''}</td>
+      <td style="padding:6px 10px;border-bottom:1px solid #f0f0f0">${dept}${!matched?' <span style="font-size:10px;color:var(--text2)">(기본)</span>':''}</td>
       <td style="padding:6px 10px;border-bottom:1px solid #f0f0f0;color:var(--text2)">${r.phone||'-'}</td>
     </tr>`;
   }).join('');
@@ -1987,13 +2277,29 @@ function importPasteData(){
   showBulkResult(result);
 }
 
+/* 지점명 유사 매칭: '신설동' → '신설동지점', '호평' → '호평지점' 등 */
+function matchDept(input, depts){
+  if(!input) return '';
+  const t = input.trim();
+  // 1) 정확 일치
+  if(depts.includes(t)) return t;
+  // 2) 부분 포함 매칭 (입력이 지점명에 포함되거나, 지점명이 입력에 포함)
+  const found = depts.find(d => d.includes(t) || t.includes(d));
+  if(found) return found;
+  // 3) 공백/특수문자 제거 후 비교
+  const clean = t.replace(/[^가-힣a-zA-Z0-9]/g,'');
+  const match = depts.find(d => d.replace(/[^가-힣a-zA-Z0-9]/g,'') === clean);
+  if(match) return match;
+  return '';
+}
+
 /* ── 핵심: 일괄 등록 공통 로직 ── */
 function bulkImport(rows){
   const depts = getDepts();
   const defaultDept = depts[0] || '';
   const mode = getPinMode();
   let agents = getAgents();
-  const existNames = new Set(agents.map(a => a.name));
+  const existKeys = new Set(agents.map(a => a.name + '::' + a.dept));
   const usedPins = new Set(agents.map(a => a.pin));
 
   let added = 0, skipped = 0, noDeptFixed = 0;
@@ -2002,10 +2308,11 @@ function bulkImport(rows){
 
   rows.forEach((r, i) => {
     if(!r.name) return;
-    if(existNames.has(r.name)){ skipped++; skippedNames.push(r.name); return; }
-
-    const dept = r.dept && depts.includes(r.dept) ? r.dept : defaultDept;
-    if(!r.dept || !depts.includes(r.dept)) noDeptFixed++;
+    const matched = matchDept(r.dept, depts);
+    const dept = matched || defaultDept;
+    if(!matched) noDeptFixed++;
+    const key = r.name + '::' + dept;
+    if(existKeys.has(key)){ skipped++; skippedNames.push(r.name); return; }
 
     // PIN 생성 (선택된 방식 적용)
     const {pin} = calcNewPin(r, usedPins, mode);
@@ -2021,7 +2328,7 @@ function bulkImport(rows){
       createdAt: today(),
     };
     agents.push(newAgent);
-    existNames.add(r.name);
+    existKeys.add(key);
     addedNames.push(r.name);
     added++;
   });
@@ -2172,10 +2479,28 @@ function renderList(){
   }
   renderPagination(pages);
 }
-function delRec(id){
+async function delRec(id){
   if(!confirm('이 교육참석 기록을 삭제할까요?')) return;
-  saveRecords(getRecords().filter(r=>r.id!==id));
-  renderList(); showToast('삭제됐습니다');
+  const before = getRecords();
+  saveRecords(before.filter(r=>r.id!==id));
+  renderList(); renderDashboard(); showToast('삭제됐습니다');
+
+  // 시트에서도 삭제
+  showSyncStatus('☁️ 시트에서 삭제 중...');
+  try {
+    const res = await fetch(SHEET_URL + '?action=deleteRecord&id=' + encodeURIComponent(id));
+    const json = await res.json();
+    if(json.ok){
+      showSyncStatus('✅ 시트 삭제 완료', 2000);
+    } else {
+      throw new Error(json.error);
+    }
+  } catch(e){
+    console.error('sheet delete error', e);
+    showSyncStatus('⚠️ 시트 삭제 실패 — 다시 시도하세요', 5000);
+    save(K_ATT, before);
+    renderList(); renderDashboard();
+  }
 }
 function renderPagination(pages){
   const pg=document.getElementById('pagination');
@@ -2229,10 +2554,11 @@ function exportAgents(){
 // ============================================================
 //  CONFIG
 // ============================================================
-function saveCfg(){
+async function saveCfg(){
   const c={hour:+document.getElementById('cfg-hour').value, min:+document.getElementById('cfg-min').value, lateMin:+document.getElementById('cfg-late').value};
   save(K_CFG, c);
   document.getElementById('cfg-result').textContent=`저장됨: 정시 기준 ${c.hour}:${String(c.min).padStart(2,'0')}, 심한지각 +${c.lateMin}분`;
+  await pushSettingsToSheet({baseCfg: c});
   showToast('설정이 저장됐습니다');
 }
 
@@ -2275,7 +2601,7 @@ function renderBranchTimeList(){
   }).join('');
 }
 
-function saveBranchTime(dept){
+async function saveBranchTime(dept){
   const h = parseInt(document.getElementById('bt-h-'+dept)?.value);
   const m = parseInt(document.getElementById('bt-m-'+dept)?.value);
   const l = parseInt(document.getElementById('bt-l-'+dept)?.value);
@@ -2283,14 +2609,16 @@ function saveBranchTime(dept){
   cfgs[dept] = {hour:h, min:m, lateMin:l};
   saveBranchCfgs(cfgs);
   renderBranchTimeList();
+  await pushSettingsToSheet({branchCfg: cfgs});
   showToast(dept+' 기준시간 저장: '+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0'));
 }
 
-function resetBranchTime(dept){
+async function resetBranchTime(dept){
   const cfgs = getBranchCfgs();
   delete cfgs[dept];
   saveBranchCfgs(cfgs);
   renderBranchTimeList();
+  await pushSettingsToSheet({branchCfg: cfgs});
   showToast(dept+' → 전체 기본값으로 초기화');
 }
 
@@ -2324,7 +2652,7 @@ function regenPin(){
   document.getElementById('edit-agent-pin').value = pin;
 }
 
-function saveAgentEdit(){
+async function saveAgentEdit(){
   const id    = document.getElementById('edit-agent-id').value;
   const name  = document.getElementById('edit-agent-name').value.trim();
   const dept  = document.getElementById('edit-agent-dept').value;
@@ -2334,15 +2662,23 @@ function saveAgentEdit(){
   if(!dept){ showToast('지점을 선택하세요'); return; }
   if(!/^\d{4}$/.test(pin)){ showToast('PIN은 4자리 숫자여야 합니다'); return; }
   const agents = getAgents();
-  // PIN 중복 검사 (본인 제외)
-  if(agents.some(a=>a.id!==id && a.pin===pin)){ showToast('이미 사용 중인 PIN입니다. 새 PIN을 발급하세요'); return; }
-  const idx = agents.findIndex(a=>a.id===id);
+  if(agents.some(a=>String(a.id)!==String(id) && String(a.pin)===pin)){ showToast('이미 사용 중인 PIN입니다. 새 PIN을 발급하세요'); return; }
+  const idx = agents.findIndex(a=>String(a.id)===String(id));
   if(idx<0){ showToast('설계사를 찾을 수 없습니다'); return; }
   agents[idx] = {...agents[idx], name, dept, phone, pin};
-  saveAgents(agents);
+
+  save(K_AGENTS, agents); // 이중 푸시 방지
   closeEditModal();
   renderAgents();
-  showToast(name+' 님 정보가 수정됐습니다');
+
+  showSyncStatus('☁️ 시트에 수정 반영 중...');
+  const ok = await pushAgentsToSheet();
+  if(ok){
+    showSyncStatus('✅ 수정 완료', 2000);
+    showToast(name+' 님 정보가 수정됐습니다');
+  } else {
+    showSyncStatus('⚠️ 시트 반영 실패 — 다시 시도하세요', 5000);
+  }
 }
 
 // ESC 키로 모달 닫기
@@ -2377,6 +2713,8 @@ function doAdminLogin(){
   if(id===cfg.id && pw===cfg.pw){
     sessionStorage.setItem(SESSION_KEY,'ok');
     document.getElementById('admin-overlay').style.display='none';
+    // 로그인 즉시 시트 동기화 시작
+    startAutoSync();
     errEl.textContent='';
     showToast('로그인됐습니다');
   } else {
@@ -2392,9 +2730,49 @@ function doAdminLogout(){
 }
 
 function checkAdminAccess(){
+  // #checkin 으로 접속하면 설계사 모드 — 관리자 로그인 건너뛰기
+  if(location.hash === '#checkin'){
+    enableAgentMode();
+    return;
+  }
   if(!isLoggedIn()){
     document.getElementById('admin-overlay').style.display='flex';
   }
+}
+
+/* ── 설계사 모드: 관리자 UI 전부 숨기고 체크인 화면만 노출 ── */
+async function enableAgentMode(){
+  // 먼저 UI 띄우고
+  _enableAgentModeUI();
+  // 시트에서 최신 데이터 받아오기
+  const ok = await syncFromSheet();
+  if(!ok){
+    showSyncStatus('⚠️ 인터넷 연결 확인 필요', 5000);
+  }
+  // 설계사 데이터가 비어있으면 안내
+  const agents = JSON.parse(localStorage.getItem('kga_agents_v2') || '[]');
+  if(agents.length === 0){
+    showSyncStatus('⚠️ 설계사 데이터 없음 — 관리자에게 문의', 8000);
+  }
+}
+
+function _enableAgentModeUI(){
+  // 1. 관리자 로그인 오버레이 강제로 숨김
+  const ov = document.getElementById('admin-overlay');
+  if(ov) ov.style.display = 'none';
+  // 2. 상단 NAV의 다른 탭 버튼 모두 숨김 (체크인 탭만 노출)
+  document.querySelectorAll('.nav-tab').forEach(btn => {
+    if(btn.dataset.panel !== 'checkin') btn.style.display = 'none';
+  });
+  document.querySelectorAll('.mobile-bottom-nav button').forEach(btn => {
+    if(btn.dataset.panel !== 'checkin') btn.style.display = 'none';
+  });
+  // 3. 로그아웃 버튼 숨김
+  document.querySelectorAll('[onclick="doAdminLogout()"]').forEach(b => b.style.display='none');
+  // 4. 체크인 탭으로 강제 전환
+  switchTab('checkin');
+  // 5. 보안 초기화 (GPS + 기기 지문)
+  initSecurityCheck();
 }
 
 function loadCfg(){
@@ -2448,14 +2826,34 @@ function genSample(){
 // ============================================================
 //  CLEAR
 // ============================================================
-function clearAttendance(){
+async function clearAttendance(){
   if(!confirm('교육참석 기록을 전부 삭제할까요?')) return;
-  saveRecords([]); renderList(); renderDashboard(); showToast('교육참석 기록이 삭제됐습니다');
+  saveRecords([]); renderList(); renderDashboard();
+  showSyncStatus('☁️ 시트에서 삭제 중...');
+  const ok = await pushRecordsToSheet();
+  if(ok){ showSyncStatus('✅ 시트 삭제 완료', 2000); showToast('교육참석 기록이 삭제됐습니다'); }
+  else { showSyncStatus('⚠️ 시트 반영 실패', 5000); }
 }
-function clearAll(){
+async function clearAgents(){
+  const count = getAgents().length;
+  if(!count){ showToast('등록된 설계사가 없습니다'); return; }
+  if(!confirm(`설계사 ${count}명을 전부 삭제할까요?\n교육참석 기록은 유지됩니다.`)) return;
+  save(K_AGENTS, []);
+  renderAgents(); renderDashboard(); showToast(`설계사 ${count}명이 삭제됐습니다`);
+  showSyncStatus('☁️ 시트에서 삭제 중...');
+  const ok = await pushAgentsToSheet();
+  if(ok){ showSyncStatus('✅ 시트 삭제 완료', 2000); }
+  else { showSyncStatus('⚠️ 시트 반영 실패', 5000); }
+}
+async function clearAll(){
   if(!confirm('설계사 정보와 교육참석 기록을 모두 삭제합니다.\n정말 초기화하시겠습니까?')) return;
   [K_AGENTS,K_ATT,K_RENEW].forEach(k=>localStorage.removeItem(k));
   renderAgents(); renderDashboard(); renderList(); showToast('전체 초기화 완료');
+  showSyncStatus('☁️ 시트 초기화 중...');
+  const ok1 = await pushAgentsToSheet();
+  const ok2 = await pushRecordsToSheet();
+  if(ok1 && ok2){ showSyncStatus('✅ 시트 초기화 완료', 2000); }
+  else { showSyncStatus('⚠️ 시트 반영 일부 실패', 5000); }
 }
 
 // ============================================================
@@ -2482,6 +2880,16 @@ document.querySelectorAll('[data-panel]').forEach(btn=>{
 function updateClock(){ document.getElementById('clock').textContent=new Date().toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
 setInterval(updateClock,1000); updateClock();
 
+/* ── 자정 자동 새로고침 (날짜 변경 시 최신 코드 로드) ── */
+(function(){
+  const pageDate = new Date().toISOString().slice(0,10);
+  setInterval(()=>{
+    if(new Date().toISOString().slice(0,10) !== pageDate){
+      location.reload();
+    }
+  }, 30000);
+})();
+
 // ============================================================
 //  INIT
 // ============================================================
@@ -2497,6 +2905,10 @@ setInterval(updateClock,1000); updateClock();
   setAgentsPinMode(getPinMode());
   // 관리자 인증 체크
   checkAdminAccess();
+  // 관리자 모드면 자동 동기화 시작
+  if(location.hash !== '#checkin' && isLoggedIn()){
+    startAutoSync();
+  }
   syncAgentsPinToggle();
   // 체크인 탭이 기본이므로 즉시 보안 초기화
   initSecurityCheck();
@@ -2514,8 +2926,7 @@ setInterval(updateClock,1000); updateClock();
   }
 })();
 
-// URL hash
-if(location.hash==='#checkin') switchTab('checkin');
+// URL hash 처리는 checkAdminAccess() 내부에서 자동 처리됨
 
 function saveAdminAccount(){
   const id  = (document.getElementById('new-admin-id')?.value||'').trim();
